@@ -33,7 +33,9 @@ mkdir logs
  
 ## Step 6: Tune parameter knobs, modify the simulation scenario setup and run a simulation campaign   
 cd mobile-network-datasets-ns3/ns-3-dev/src/nr/examples/dataset_gen_scripts 
+
 edit run_script.sh as required
+
 bash run_script.sh 
 
 ### Curated datasets generated from these scripts can be found at (google drive link)
