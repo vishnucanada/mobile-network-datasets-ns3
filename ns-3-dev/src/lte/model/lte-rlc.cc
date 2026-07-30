@@ -171,6 +171,12 @@ LteRlc::GetLteMacSapUser ()
   return m_macSapUser;
 }
 
+uint32_t
+LteRlc::GetTxQueueSize (void) const
+{
+  return 0;
+}
+
 
 
 ////////////////////////////////////////

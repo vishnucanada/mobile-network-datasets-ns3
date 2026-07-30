@@ -105,6 +105,14 @@ public:
    */
   LteMacSapUser* GetLteMacSapUser ();
 
+  /**
+   * \brief Get the current amount of data queued for transmission (bytes).
+   * Base implementation returns 0; subclasses that maintain a TX buffer
+   * (LteRlcUm, LteRlcAm) override this.
+   *
+   * \return the queued TX size in bytes
+   */
+  virtual uint32_t GetTxQueueSize (void) const;
 
   /**
    * TracedCallback signature for NotifyTxOpportunity events.

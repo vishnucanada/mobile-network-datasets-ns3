@@ -60,6 +60,8 @@ public:
   virtual void DoNotifyHarqDeliveryFailure ();
   virtual void DoReceivePdu (LteMacSapUser::ReceivePduParameters rxPduParams);
 
+  virtual uint32_t GetTxQueueSize (void) const;
+
 private:
   /// Expire reordering timer
   void ExpireReorderingTimer (void);

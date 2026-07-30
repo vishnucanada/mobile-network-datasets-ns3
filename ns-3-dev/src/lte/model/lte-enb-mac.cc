@@ -368,6 +368,10 @@ LteEnbMac::GetTypeId (void)
                      "Information regarding UL scheduling.",
                      MakeTraceSourceAccessor (&LteEnbMac::m_ulScheduling),
                      "ns3::LteEnbMac::UlSchedulingTracedCallback")
+    .AddTraceSource ("DlHarqFeedback",
+                     "Per-RNTI DL HARQ ACK/NACK feedback (radio-KPI extension).",
+                     MakeTraceSourceAccessor (&LteEnbMac::m_dlHarqFeedbackTrace),
+                     "ns3::LteEnbMac::DlHarqFeedbackTracedCallback")
     .AddAttribute ("ComponentCarrierId",
                    "ComponentCarrier Id, needed to reply on the appropriate sap.",
                    UintegerValue (0),
@@ -1334,6 +1338,7 @@ LteEnbMac::DoDlInfoListElementHarqFeeback (DlInfoListElement_s params)
         {
           NS_FATAL_ERROR (" HARQ functionality not implemented");
         }
+      m_dlHarqFeedbackTrace (params.m_rnti, params.m_harqStatus.at (layer) == DlInfoListElement_s::NACK);
     }
   m_dlInfoListReceived.push_back (params);
 }

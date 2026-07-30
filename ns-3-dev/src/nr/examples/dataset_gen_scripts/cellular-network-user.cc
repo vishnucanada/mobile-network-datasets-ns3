@@ -96,6 +96,23 @@ main (int argc, char *argv[])
     cmd.AddValue ("freqScenario",
                 "0: NON_OVERLAPPING (each sector in different freq), 1: OVERLAPPING (same freq for all sectors)",
                 params.freqScenario);
+    cmd.AddValue ("pathlossModel",
+                "Override the scenario-derived LTE pathloss model, e.g. "
+                "ns3::FriisPropagationLossModel for a cheap free-space model instead "
+                "of the default ThreeGppUmi/Uma/RmaPropagationLossModel. Empty = no override.",
+                params.pathlossModelOverride);
+    cmd.AddValue ("shadowingEnabled",
+                "Enable shadow fading on the ThreeGpp* pathloss models (ignored if "
+                "--pathlossModel overrides to a model without a ShadowingEnabled "
+                "attribute, e.g. Friis). Disabling removes the spatially-correlated "
+                "shadow-fading recomputation as UEs move -- cheaper, less realistic.",
+                params.shadowingEnabled);
+    cmd.AddValue ("macroMicroSharedSpectrum",
+                "If true (default), the micro layer reuses the macro layer's EARFCN, so "
+                "SINR/interference is computed across both layers every subframe. Set false "
+                "to put the micro layer on its own EARFCN (band 7, 2620MHz) instead, removing "
+                "the macro<->micro cross-tier interference term -- cheaper but less realistic.",
+                params.macroMicroSharedSpectrum);
     cmd.AddValue ("enableUlPc",
                 "Whether to enable or disable UL power control",
                 params.enableUlPc);
@@ -111,6 +128,18 @@ main (int argc, char *argv[])
     cmd.AddValue ("appRtt",
                 "Install the round trip time measurement application",
                 params.traceRtt);
+    cmd.AddValue ("appRadioKpi",
+                "Install the per-UE radio-KPI extension (radio_kpi.csv); requires appRtt=true",
+                params.traceRadioKpi);
+    cmd.AddValue ("radioKpiGrid",
+                "Window size in seconds for radio_kpi.csv sampling",
+                params.radioKpiGrid);
+    cmd.AddValue ("ranTraces",
+                "Enable the LTE/NR module's own per-TTI PHY/MAC/RLC/PDCP/interference "
+                "stat files (UlInterferenceStats.txt etc). Not needed for delay/radio-KPI "
+                "extraction and dominates disk usage and runtime on long runs -- set "
+                "false for long delay-only runs.",
+                params.ranTraces);
     cmd.AddValue ("appDlThput",
                 "Install the downlink throughput measurement application",
                 params.traceDlThput);

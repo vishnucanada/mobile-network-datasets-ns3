@@ -82,6 +82,12 @@ LteRlcUm::DoDispose ()
   LteRlc::DoDispose ();
 }
 
+uint32_t
+LteRlcUm::GetTxQueueSize (void) const
+{
+  return m_txBufferSize;
+}
+
 /**
  * RLC SAP
  */

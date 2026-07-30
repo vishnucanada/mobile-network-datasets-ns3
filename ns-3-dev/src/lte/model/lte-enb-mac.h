@@ -182,7 +182,17 @@ public:
   typedef void (* UlSchedulingTracedCallback)
     (const uint32_t frame, const uint32_t subframe, const uint16_t rnti,
      const uint8_t mcs, const uint16_t tbsSize);
-  
+
+  /**
+   * TracedCallback signature for per-RNTI DL HARQ ACK/NACK feedback
+   * (radio-KPI extension: source for the mac_retries KPI).
+   *
+   * \param [in] rnti The C-RNTI identifying the UE.
+   * \param [in] isNack true if this layer's feedback was a NACK (retransmission needed).
+   */
+  typedef void (* DlHarqFeedbackTracedCallback)
+    (const uint16_t rnti, const bool isNack);
+
 private:
 
   /**
@@ -432,7 +442,13 @@ private:
    */
   TracedCallback<uint32_t, uint32_t, uint16_t,
                  uint8_t, uint16_t, uint8_t> m_ulScheduling;
-  
+
+  /**
+   * Trace information regarding per-RNTI DL HARQ ACK/NACK feedback
+   * (radio-KPI extension: source for the mac_retries KPI).
+   */
+  TracedCallback<uint16_t, bool> m_dlHarqFeedbackTrace;
+
   uint8_t m_macChTtiDelay; ///< delay of MAC, PHY and channel in terms of TTIs
 
 

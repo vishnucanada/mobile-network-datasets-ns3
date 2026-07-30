@@ -64,6 +64,8 @@ public:
   virtual void DoNotifyHarqDeliveryFailure ();
   virtual void DoReceivePdu (LteMacSapUser::ReceivePduParameters rxPduParams);
 
+  virtual uint32_t GetTxQueueSize (void) const;
+
 private:
   /**
    * This method will schedule a timeout at WaitReplyTimeout interval

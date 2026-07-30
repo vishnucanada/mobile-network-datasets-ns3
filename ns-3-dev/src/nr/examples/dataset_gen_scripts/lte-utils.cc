@@ -158,6 +158,11 @@ LteUtils::SetLteSimulatorParameters (const Parameters &params,
       NS_FATAL_ERROR ("Selected scenario " << params.scenario << " not valid. Valid values: UMa, UMi, RMa");
     }
 
+  if (!params.pathlossModelOverride.empty ())
+    {
+      pathlossModel = params.pathlossModelOverride;
+    }
+
   lteHelper = CreateObject<LteHelper> ();
   lteHelper->SetEpcHelper (epcHelper);
 
@@ -177,7 +182,13 @@ LteUtils::SetLteSimulatorParameters (const Parameters &params,
  lteHelper->SetAttribute ("PathlossModel", StringValue (pathlossModel)); // for each band the same pathloss model
   
   //WARNING: should be enabled
-  lteHelper->SetPathlossModelAttribute ("ShadowingEnabled", BooleanValue (true));
+  // Only the ThreeGpp* models have a ShadowingEnabled attribute -- Friis/Range
+  // (params.pathlossModelOverride) don't, and SetPathlossModelAttribute on a
+  // model without it is a fatal ns-3 attribute-lookup error, not a no-op.
+  if (pathlossModel.find ("ThreeGpp") != std::string::npos)
+    {
+      lteHelper->SetPathlossModelAttribute ("ShadowingEnabled", BooleanValue (params.shadowingEnabled));
+    }
   
   if (params.handoverAlgo == "A3Rsrp") 
   {

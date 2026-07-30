@@ -569,12 +569,28 @@ void CellularNetwork (const Parameters &params){
     **********************************************/
     uint16_t ulFlowPortNum = 1234;
     uint16_t dlFlowPortNum = 1235;
-    uint16_t echoPortNum = 9; // well known echo port
     uint16_t ulDelayPortNum = 17000;
     uint16_t dlDelayPortNum = 18000;
     uint16_t dashPortNum = 15000;
     uint16_t vrPortNum = 16000;
     //uint16_t httpPortNum = 31000;
+
+    // Protocol-tagged RTT probes matching the qos_multiue.cc protocol taxonomy:
+    // each protocol gets its own echo port + payload size, so rttTrace can
+    // recover which protocol a sample belongs to from the reply's source port.
+    struct ProtoDef { std::string name; uint16_t port; uint32_t size; };
+    static const std::vector<ProtoDef> protoDefs = {
+        {"icmp",  9101, 64},
+        {"twamp", 9102, 128},
+        {"http",  9103, 1400},
+        {"https", 9104, 1200},
+        {"tcp",   9105, 800},
+        {"udp",   9106, 256},
+    };
+    for (const auto &pd : protoDefs)
+    {
+        g_protoPortMap[pd.port] = pd.name;
+    }
 
     uint32_t echoPacketCount = 0xFFFFFFFF;
     uint32_t delayPacketCount = 0xFFFFFFFF; 
@@ -620,7 +636,8 @@ void CellularNetwork (const Parameters &params){
     ThreeGppHttpServerHelper httpServer (remoteHostAddr);
     //DashServerHelper dashServer ("ns3::TcpSocketFactory", 
     //                             InetSocketAddress (Ipv4Address::GetAny (), dashPortNum));
-    UdpEchoServerHelper echoServer (echoPortNum);
+    std::vector<UdpEchoServerHelper> echoServers;
+    for (const auto &pd : protoDefs) echoServers.emplace_back (pd.port);
     //vr  
     Ptr<UniformRandomVariable> vrStart = CreateObject<UniformRandomVariable> ();
     vrStart->SetAttribute ("Min", DoubleValue (params.vrStartTimeMin));
@@ -652,7 +669,8 @@ void CellularNetwork (const Parameters &params){
     }*/
     if(params.traceRtt)
     {
-        serverApps.Add (echoServer.Install (remoteHost)); // appId updated on remoteHost
+        for (auto &es : echoServers)
+            serverApps.Add (es.Install (remoteHost)); // appId updated on remoteHost
     }
 
     //========================================================
@@ -664,7 +682,8 @@ void CellularNetwork (const Parameters &params){
     UdpClientHelper dlFlowClient;
     UdpClientHelper ulDelayClient;
     UdpClientHelper dlDelayClient;
-    UdpEchoClientHelper echoClient (remoteHostAddr, echoPortNum);
+    std::vector<UdpEchoClientHelper> echoClients;
+    for (const auto &pd : protoDefs) echoClients.emplace_back (remoteHostAddr, pd.port);
     //DashClientHelper dashClient ("ns3::TcpSocketFactory", InetSocketAddress (remoteHostAddr, dashPortNum), params.abr);
     ThreeGppHttpClientHelper httpClient (remoteHostAddr);
     //vr
@@ -701,10 +720,13 @@ void CellularNetwork (const Parameters &params){
     }
     if(params.traceRtt)
     {
-        // Configure echo client application
-        echoClient.SetAttribute ("MaxPackets", UintegerValue (echoPacketCount));
-        echoClient.SetAttribute ("Interval", TimeValue (params.echoInterPacketInterval));
-        echoClient.SetAttribute ("PacketSize", UintegerValue (params.echoPacketSize));
+        // Configure the 6 protocol-tagged echo client applications
+        for (size_t i = 0; i < echoClients.size (); ++i)
+        {
+            echoClients[i].SetAttribute ("MaxPackets", UintegerValue (echoPacketCount));
+            echoClients[i].SetAttribute ("Interval", TimeValue (params.echoInterPacketInterval));
+            echoClients[i].SetAttribute ("PacketSize", UintegerValue (protoDefs[i].size));
+        }
     }
     /*if(params.traceDash)
     {
@@ -757,12 +779,15 @@ void CellularNetwork (const Parameters &params){
         }
         if(params.traceRtt)
         {
-            auto appsClass1 = InstallUdpEchoApps (node,
-                              &echoClient,
-                              params.appStartTime,
-                              startRng, params.appGenerationTime);
-            clientApps.Add (appsClass1.first);
-        } 
+            for (auto &ec : echoClients)
+            {
+                auto appsClass1 = InstallUdpEchoApps (node,
+                                  &ec,
+                                  params.appStartTime,
+                                  startRng, params.appGenerationTime);
+                clientApps.Add (appsClass1.first);
+            }
+        }
         // Install full buffer BulkSend traffic on only one UE to test the 
         // TCP throughput achieved as the UE moves within the topology
         // This should be installed on one of the fast speed UEs so that it can 
@@ -938,12 +963,15 @@ void CellularNetwork (const Parameters &params){
         }
         if(params.traceRtt)
         {
-            auto appsClass1 = InstallUdpEchoApps (node,
-                              &echoClient,
-                              params.appStartTime,
-                              startRng, params.appGenerationTime);
-            clientApps.Add (appsClass1.first);
-        } 
+            for (auto &ec : echoClients)
+            {
+                auto appsClass1 = InstallUdpEchoApps (node,
+                                  &ec,
+                                  params.appStartTime,
+                                  startRng, params.appGenerationTime);
+                clientApps.Add (appsClass1.first);
+            }
+        }
         // Install full buffer BulkSend traffic on only one UE to test the 
         // TCP throughput achieved as the UE moves within the topology
         // This should be installed on one of the fast speed UEs so that it can 
@@ -1122,7 +1150,7 @@ if(params.traceFlow)
     }
 
     // enable the RAN traces provided by the LTE or NR module
-    if (params.traces == true)
+    if (params.ranTraces == true)
     {
       if (lteHelper != nullptr)
         {
@@ -1162,8 +1190,17 @@ if(params.traceFlow)
 
         if(params.traceRtt)
         {
-            Config::Connect ("/NodeList/*/ApplicationList/*/$ns3::UdpEchoClient/RxWithAddresses", 
+            Config::Connect ("/NodeList/*/ApplicationList/*/$ns3::UdpEchoClient/RxWithAddresses",
                              MakeBoundCallback (&rttTrace, rttStream));
+        }
+        if(params.traceRadioKpi)
+        {
+            Config::Connect ("/NodeList/*/DeviceList/*/ComponentCarrierMapUe/*/LteUePhy/ReportCurrentCellRsrpSinr",
+                             MakeCallback (&RsrpSinrKpiTrace));
+            Config::Connect ("/NodeList/*/DeviceList/*/ComponentCarrierMap/*/LteEnbMac/DlScheduling",
+                             MakeCallback (&DlSchedulingKpiTrace));
+            Config::Connect ("/NodeList/*/DeviceList/*/ComponentCarrierMap/*/LteEnbMac/DlHarqFeedback",
+                             MakeCallback (&DlHarqFeedbackKpiTrace));
         }
         if(params.traceDash)
         {
@@ -1203,6 +1240,12 @@ if(params.traceFlow)
     Simulator::Stop (stopTime);
     // schedule the periodic logging of UE positions
     Simulator::Schedule (MilliSeconds(500), &LogPosition, mobStream);
+    if (params.traceRadioKpi)
+    {
+        // Start after appStartTime+appStartWindow so every UE's default
+        // bearer is guaranteed up before the first queue_bytes sample.
+        Simulator::Schedule (params.appStartTime + appStartWindow, &RadioKpiSample, radioKpiStream);
+    }
     // To print info, some of which is only available a few milliseconds 
     // after the simulation is setup and UEs attached
     Simulator::Schedule (MilliSeconds(400), &ScenarioInfo, scenario);

@@ -76,6 +76,14 @@ struct Parameters
     
     bool logging = false; // NS_LOG for debugging
     bool traces = true;
+    // Master switch for the LTE/NR module's own per-TTI PHY/MAC/RLC/PDCP/
+    // interference stat files (lteHelper/nrHelper->EnableTraces() below --
+    // UlInterferenceStats.txt etc). These are NOT needed for delay/radio-KPI
+    // extraction (rtt_trace.txt, radio_kpi.csv use their own Config::Connect
+    // sinks gated by `traces` above) and dominate both disk usage (multi-GB)
+    // and wall-clock runtime on long runs. Default true to preserve existing
+    // behavior; set false via --ranTraces=false for long delay-only runs.
+    bool ranTraces = true;
     Time appGenerationTime = Seconds (1000);
     Time appStartTime = MilliSeconds (500);
     Time progressInterval = Seconds (1);
@@ -99,6 +107,13 @@ struct Parameters
     std::string handoverAlgo = "A2A4Rsrq"; // Options are "A3Rsrp" or "A2A4Rsrq"
     uint32_t manualHoTriggerTime = 256 ;// milliSeconds 
     bool macroMicroSharedSpectrum = true;
+    // Cheaper propagation-loss alternatives (see lte-utils.cc's commented-out
+    // FriisPropagationLossModel/ShadowingEnabled options -- the original authors
+    // already scaffolded both). Empty string = keep the scenario-derived default
+    // (ThreeGppUmi/Uma/RmaPropagationLossModel); set to e.g.
+    // "ns3::FriisPropagationLossModel" to override with a cheap free-space model.
+    std::string pathlossModelOverride = "";
+    bool shadowingEnabled = true;
     // This needs to be adjusted according to data bandwidth, or one will not be able to use the full BW of the RAN 
     uint32_t rlcUmTxBuffSize = 100*1024; //ns3 default is 10240 which is too small and restricts bandwidth 
                                          //especially VR which pushes a very large frame to the buffer all at once
@@ -125,6 +140,11 @@ struct Parameters
     // delay measurement 
     bool traceDelay = true;
     bool traceRtt = false;
+    // Radio-KPI extension (per-UE snr/mcs/queue/retries/loss/jitter/MOS, windowed
+    // into radio_kpi.csv): shares the protocol-tagged RTT accumulator, so it
+    // requires traceRtt (checked in Validate()).
+    bool traceRadioKpi = false;
+    Time radioKpiGrid = Seconds (10);
     // traffic apps to make it interesting
     bool traceHttp = false;
     bool traceDash = false;
@@ -207,6 +227,8 @@ struct Parameters
                        "Unrecognized handover algorithm: " << handoverAlgo);
         NS_ABORT_MSG_IF (useMicroLayer && rat != "LTE",
                        "Cannot create micro layer unless using 4G LTE: ");
+        NS_ABORT_MSG_IF (traceRadioKpi && !traceRtt,
+                       "traceRadioKpi requires traceRtt (it reuses the protocol-tagged RTT probes/accumulator)");
         return true;
     }   
 };      

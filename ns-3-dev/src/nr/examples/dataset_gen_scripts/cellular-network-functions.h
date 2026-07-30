@@ -41,6 +41,9 @@
 
 #include "cellular-network.h"
 
+#include <limits>
+#include <cmath>
+
 #ifndef CELLULAR_NETWORK_FUNCTION_H
 #define CELLULAR_NETWORK_FUNCTION_H
 
@@ -73,6 +76,7 @@ Ptr<OutputStreamWrapper> httpClientRttStream;
 Ptr<OutputStreamWrapper> httpServerDelayStream;
 Ptr<OutputStreamWrapper> flowStream;
 Ptr<OutputStreamWrapper> rttStream;
+Ptr<OutputStreamWrapper> radioKpiStream;
 Ptr<OutputStreamWrapper> topologyStream;         
 Ptr<OutputStreamWrapper> fragmentRxStream;
 Ptr<OutputStreamWrapper> burstRxStream;   
@@ -89,8 +93,48 @@ std::vector<uint32_t> vrAppUes;
 std::vector<uint32_t> httpAppUes;
 std::vector<uint32_t> onlyDelayUes;
 
-    
-    
+// Protocol-tagged RTT probes (added to match the qos_multiue.cc protocol taxonomy):
+// port -> protocol name, populated once in CellularNetwork() before app install.
+std::map<uint16_t, std::string> g_protoPortMap;
+
+/***************************
+ * Radio-KPI extension globals
+ ***************************/
+
+// Per-UE, per-window accumulator for radio_kpi.csv. Two lifetimes are mixed here
+// on purpose: the "window-reset" fields are drained and zeroed by RadioKpiSample()
+// every --radioKpiGrid; the "persistent" fields (sequence tracking, jitter EWMA,
+// the live loss streak) must survive across window boundaries because a loss run
+// or a jitter estimate can straddle a flush.
+struct RadioKpiAcc
+{
+  // per-protocol windowed mean RTT (window-reset)
+  std::map<std::string, double>   rttSumMs;
+  std::map<std::string, uint32_t> rttCount;
+
+  // radio (window-reset)
+  double   snrSumDb = 0.0;
+  uint32_t snrCount = 0;
+  double   mcsSum = 0.0;
+  uint32_t mcsCount = 0;
+  uint32_t macRetries = 0; ///< count of DL HARQ NACKs this window
+
+  // loss/jitter, reference probe = icmp (window-reset counters)
+  uint32_t lossCountWin = 0;
+  uint32_t recvCountWin = 0;
+  uint32_t maxConsecLossWin = 0;
+
+  // loss/jitter persistent state (survives window flush)
+  bool     seqInit = false;
+  uint32_t expectedSeq = 0;
+  double   lastTransitMs = 0.0;
+  double   jitterEstMs = 0.0;
+  uint32_t consecLoss = 0;
+};
+std::map<uint16_t, RadioKpiAcc> g_radioKpiAcc; ///< keyed by ueId
+
+
+
 /***************************
  * Structure Definitions
  ***************************/
@@ -180,8 +224,15 @@ void flowTrace (Ptr<OutputStreamWrapper> stream,
                 std::string context,
                 Ptr<const Packet> packet, const Address &from, const Address &localAddress);
 void rttTrace (Ptr<OutputStreamWrapper> stream,
-                std::string context, 
+                std::string context,
                 Ptr<const Packet> packet, const Address &from, const Address &localAddress);
+int32_t GetUeIdFromEnbRnti (uint16_t enbNodeId, uint16_t rnti);
+double ComputeMos (double rttMeanMs, double jitterMs, double lossFrac);
+void RsrpSinrKpiTrace (std::string context, uint16_t cellId, uint16_t rnti,
+                double rsrp, double sinr, uint8_t ccId);
+void DlSchedulingKpiTrace (std::string context, DlSchedulingCallbackInfo info);
+void DlHarqFeedbackKpiTrace (std::string context, uint16_t rnti, bool isNack);
+void RadioKpiSample (Ptr<OutputStreamWrapper> stream);
 void BurstRx (Ptr<OutputStreamWrapper> stream,
                 std::string context, Ptr<const Packet> burst, const Address &from, const Address &to,
          const SeqTsSizeFragHeader &header);
@@ -396,7 +447,77 @@ GetServingEnbDev_from_ueId (uint16_t ueId)
     }
     NS_ABORT_MSG ("Could not find serving cell for UE with IMSI: "<< GetImsi_from_ueId (ueId));
 }
-    
+
+// Resolves a UE's global ueId from its serving eNB's node id (from a trace
+// context path) and its current RNTI, using the eNB's live RRC UE map.
+// Relies on the ns-3 LTE invariant that IMSI is assigned sequentially
+// (1-based) in InstallUeDevice() in the same order as the ueNodes container,
+// so ueId == imsi - 1 (same invariant GetImsi_from_ueId's callers already
+// depend on implicitly). Returns -1 if the RNTI isn't (yet) registered with
+// that eNB (e.g. mid random-access) -- callers must not call this with
+// rnti == 0.
+int32_t
+GetUeIdFromEnbRnti (uint16_t enbNodeId, uint16_t rnti)
+{
+    if (rnti == 0)
+    {
+        return -1;
+    }
+    Ptr<Node> enbNode = NodeList::GetNode (enbNodeId);
+    Ptr<LteEnbNetDevice> enbDev = enbNode->GetDevice (0)->GetObject<LteEnbNetDevice> ();
+    if (enbDev == nullptr)
+    {
+        return -1;
+    }
+    if (!enbDev->GetRrc ()->HasUeManager (rnti))
+    {
+        return -1;
+    }
+    uint64_t imsi = enbDev->GetRrc ()->GetUeManager (rnti)->GetImsi ();
+    return static_cast<int32_t> (imsi - 1);
+}
+
+// Simplified ITU-T G.107 E-model MOS estimate from a protocol's own windowed
+// mean RTT, the window's shared jitter and loss fraction. This is a synthetic
+// QoE proxy derived from the RTT probes (no real codec/application is being
+// scored) -- documented in radio_kpi.csv's header comment, and deliberately
+// never used as an anomaly-labeling trigger (see label_radio_anomalies.py).
+double
+ComputeMos (double rttMeanMs, double jitterMs, double lossFrac)
+{
+    if (std::isnan (rttMeanMs))
+    {
+        return std::numeric_limits<double>::quiet_NaN ();
+    }
+    double loss = std::isnan (lossFrac) ? 0.0 : lossFrac;
+    // One-way delay approximation from RTT, plus a fixed codec/lookahead
+    // allowance -- the standard simplified delay-impairment (Id) formula.
+    double oneWayMs = rttMeanMs / 2.0;
+    double effLatencyMs = oneWayMs + 2.0 * jitterMs + 10.0;
+    double id = (effLatencyMs < 160.0) ? (effLatencyMs / 40.0)
+                                        : ((effLatencyMs - 120.0) / 10.0);
+    // Generic (non-codec-specific) packet-loss impairment (Ie); Bpl=10 is a
+    // placeholder robustness factor since no real codec is being modeled.
+    const double ieBase = 0.0;
+    const double bpl = 10.0;
+    double ie = ieBase + (95.0 - ieBase) * (loss / (loss + bpl));
+    double r = 93.2 - id - ie;
+    double mos;
+    if (r < 0.0)
+    {
+        mos = 1.0;
+    }
+    else if (r > 100.0)
+    {
+        mos = 4.5;
+    }
+    else
+    {
+        mos = 1.0 + 0.035 * r + r * (r - 60.0) * (100.0 - r) * 7.0e-6;
+    }
+    return std::min (5.0, std::max (1.0, mos));
+}
+
 void
 ScenarioInfo (NodeDistributionScenarioInterface* scenario)
 {
@@ -892,18 +1013,221 @@ void rttTrace (Ptr<OutputStreamWrapper> stream,
 
   if (InetSocketAddress::IsMatchingType (from))
   {
-    *stream->GetStream() 
+    // The echo reply comes FROM the protocol-specific echo server port, so the
+    // port alone tells us which protocol class this sample belongs to.
+    uint16_t fromPort = InetSocketAddress::ConvertFrom (from).GetPort ();
+    auto it = g_protoPortMap.find (fromPort);
+    std::string proto = (it != g_protoPortMap.end ()) ? it->second : "unknown";
+    int64_t rttUs = (Simulator::Now () - seqTs.GetTs ()).GetMicroSeconds ();
+    *stream->GetStream()
 	 << Simulator::Now ().GetMicroSeconds ()
 	 << "\t" << ueId // ue global id
 	 << "\t" << GetImsi_from_ueId(ueId)
 	 << "\t" << GetCellId_from_ueId(ueId)
+	 << "\t" << proto
          << "\t" << packet_copy->GetSize () // received size
          << "\t" << seqTs.GetSeq () //current sequence number
          << "\t" << packet_copy->GetUid ()
          << "\t" << (seqTs.GetTs ()).GetMicroSeconds () // tx TimeStamp
-         << "\t" << (Simulator::Now () - seqTs.GetTs ()).GetMicroSeconds () // rtt
+         << "\t" << rttUs // rtt
          << std::endl;
+
+    if (global_params.traceRadioKpi)
+    {
+      RadioKpiAcc &acc = g_radioKpiAcc[ueId];
+      double rttMs = rttUs / 1000.0;
+      acc.rttSumMs[proto] += rttMs;
+      acc.rttCount[proto] += 1;
+
+      // Loss/jitter are protocol-agnostic in the output schema (driven by path
+      // conditions, not by which protocol tag is on the packet -- see plan),
+      // so a single reference probe stream is used to infer them via sequence
+      // gaps: icmp, since every protocol shares the same probe cadence and
+      // icmp is the conventional liveness reference.
+      if (proto == "icmp")
+      {
+        uint32_t seqNum = seqTs.GetSeq ();
+        if (!acc.seqInit)
+        {
+          acc.seqInit = true;
+        }
+        else if (seqNum >= acc.expectedSeq)
+        {
+          uint32_t gap = seqNum - acc.expectedSeq;
+          if (gap > 0)
+          {
+            acc.lossCountWin += gap;
+            acc.consecLoss += gap;
+            acc.maxConsecLossWin = std::max (acc.maxConsecLossWin, acc.consecLoss);
+          }
+          acc.consecLoss = 0; // this receipt breaks any loss streak
+        }
+        acc.expectedSeq = seqNum + 1;
+        acc.recvCountWin += 1;
+
+        // RFC 3550-style running jitter estimate. We only have RTT (the probe
+        // is a round-trip echo, no clock sync needed to measure it), so this
+        // uses RTT as the "transit time" signal -- a standard simplification
+        // when one-way delay isn't observable.
+        if (acc.lastTransitMs > 0.0)
+        {
+          double d = std::fabs (rttMs - acc.lastTransitMs);
+          acc.jitterEstMs += (d - acc.jitterEstMs) / 16.0;
+        }
+        acc.lastTransitMs = rttMs;
+      }
+    }
   }
+}
+
+// UE-side trace (ReportCurrentCellRsrpSinr fires on the UE's own LteUePhy), so
+// the context node id IS the UE's node id -- same pattern as rttTrace, no rnti
+// resolution needed.
+void
+RsrpSinrKpiTrace (std::string context, uint16_t cellId, uint16_t rnti,
+                double rsrp, double sinr, uint8_t ccId)
+{
+  uint16_t ueId = GetUeIdFromNodeId (GetNodeIdFromContext (context));
+  RadioKpiAcc &acc = g_radioKpiAcc[ueId];
+  double sinrDb = 10.0 * std::log10 (sinr);
+  if (std::isfinite (sinrDb))
+  {
+    acc.snrSumDb += sinrDb;
+    acc.snrCount += 1;
+  }
+}
+
+// eNB-side trace (LteEnbMac::DlScheduling), one eNB serves many UEs, so the
+// UE is identified by rnti via GetUeIdFromEnbRnti, not by context node id.
+void
+DlSchedulingKpiTrace (std::string context, DlSchedulingCallbackInfo info)
+{
+  int32_t ueId = GetUeIdFromEnbRnti (GetNodeIdFromContext (context), info.rnti);
+  if (ueId < 0)
+  {
+    return;
+  }
+  RadioKpiAcc &acc = g_radioKpiAcc[static_cast<uint16_t> (ueId)];
+  // TB1 is always present when this UE is scheduled; TB2 (MIMO 2nd layer) is
+  // 0/0 when unused -- only average TB1 to avoid biasing the mean toward 0.
+  acc.mcsSum += info.mcsTb1;
+  acc.mcsCount += 1;
+}
+
+// eNB-side trace (the Step-1 DlHarqFeedback patch on LteEnbMac); same rnti
+// resolution as DlSchedulingKpiTrace.
+void
+DlHarqFeedbackKpiTrace (std::string context, uint16_t rnti, bool isNack)
+{
+  int32_t ueId = GetUeIdFromEnbRnti (GetNodeIdFromContext (context), rnti);
+  if (ueId < 0)
+  {
+    return;
+  }
+  if (isNack)
+  {
+    g_radioKpiAcc[static_cast<uint16_t> (ueId)].macRetries += 1;
+  }
+}
+
+// Periodic (--radioKpiGrid) flush of the per-UE accumulator into radio_kpi.csv.
+// Drains and resets the window-scoped counters; the persistent loss/jitter
+// state (see RadioKpiAcc) is left untouched so it carries across windows.
+void
+RadioKpiSample (Ptr<OutputStreamWrapper> stream)
+{
+  static const std::vector<std::string> protoOrder =
+      {"http", "https", "icmp", "tcp", "twamp", "udp"};
+  const double nan = std::numeric_limits<double>::quiet_NaN ();
+
+  for (uint32_t ueId = 0; ueId < ueNodes.GetN (); ++ueId)
+  {
+    Ptr<Node> ue_node = ueNodes.Get (ueId);
+    Vector pos = ue_node->GetObject<MobilityModel> ()->GetPosition ();
+    RadioKpiAcc &acc = g_radioKpiAcc[ueId];
+
+    double snrDb = (acc.snrCount > 0) ? (acc.snrSumDb / acc.snrCount) : nan;
+    double mcs = (acc.mcsCount > 0) ? (acc.mcsSum / acc.mcsCount) : nan;
+    // A window with zero icmp receipts can't distinguish "no probes sent"
+    // from "total outage" from raw arrivals alone, so loss_frac is left NaN
+    // -- the NaN itself is the outage signal (same convention as the
+    // radio-outage gaps in qos_multiue.cc's output).
+    double lossFrac = (acc.recvCountWin > 0)
+        ? (static_cast<double> (acc.lossCountWin)
+           / static_cast<double> (acc.lossCountWin + acc.recvCountWin))
+        : nan;
+    double jitterMs = acc.jitterEstMs;
+    uint32_t maxConsecLoss = acc.maxConsecLossWin;
+    uint32_t macRetries = acc.macRetries;
+
+    // Instantaneous DL RLC TX-queue sample (live getter via the Step-1
+    // GetTxQueueSize() patch, not event-accumulated -- see plan's note that
+    // this is a deliberate implementation choice). Only sampled when the UE
+    // is fully connected (not mid-handover/RA) to avoid the RRC/bearer-setup
+    // race on LteEnbRrc::GetUeManager / UeManager::GetDataRadioBearerInfo,
+    // both of which assert (abort the whole run) on an unknown rnti/drbid.
+    double queueBytes = nan;
+    Ptr<LteUeRrc> ueRrc = ue_node->GetDevice (0)->GetObject<LteUeNetDevice> ()->GetRrc ();
+    if (ueRrc->GetState () == LteUeRrc::CONNECTED_NORMALLY)
+    {
+      uint16_t rnti = ueRrc->GetRnti ();
+      Ptr<LteEnbNetDevice> enbDev = GetServingEnbDev_from_ueId (ueId);
+      if (enbDev->GetRrc ()->HasUeManager (rnti))
+      {
+        // drbid is always 1: this scenario only ever activates the single
+        // default EPS bearer per UE (no dedicated bearers requested), and
+        // ns-3 allocates drbids starting at 1 (see UeManager::AddDataRadioBearerInfo).
+        queueBytes = enbDev->GetRrc ()->GetUeManager (rnti)->GetDrbTxQueueSize (1);
+      }
+    }
+
+    *stream->GetStream ()
+        << Simulator::Now ().GetMicroSeconds ()
+        << "\t" << ueId
+        << "\t" << GetImsi_from_ueId (ueId)
+        << "\t" << GetCellId_from_ueId (ueId)
+        << "\t" << pos.x << "\t" << pos.y;
+
+    std::map<std::string, double> rttMean;
+    for (const auto &proto : protoOrder)
+    {
+      auto cntIt = acc.rttCount.find (proto);
+      double mean = (cntIt != acc.rttCount.end () && cntIt->second > 0)
+          ? (acc.rttSumMs[proto] / cntIt->second)
+          : nan;
+      rttMean[proto] = mean;
+      *stream->GetStream () << "\t" << mean;
+    }
+
+    *stream->GetStream ()
+        << "\t" << snrDb
+        << "\t" << lossFrac
+        << "\t" << jitterMs
+        << "\t" << maxConsecLoss
+        << "\t" << queueBytes
+        << "\t" << macRetries
+        << "\t" << mcs;
+
+    for (const auto &proto : protoOrder)
+    {
+      *stream->GetStream () << "\t" << ComputeMos (rttMean[proto], jitterMs, lossFrac);
+    }
+    *stream->GetStream () << std::endl;
+
+    // Reset window-scoped fields only; persistent loss/jitter state survives.
+    acc.rttSumMs.clear ();
+    acc.rttCount.clear ();
+    acc.snrSumDb = 0.0;
+    acc.snrCount = 0;
+    acc.mcsSum = 0.0;
+    acc.mcsCount = 0;
+    acc.macRetries = 0;
+    acc.lossCountWin = 0;
+    acc.recvCountWin = 0;
+    acc.maxConsecLossWin = 0;
+  }
+
+  Simulator::Schedule (global_params.radioKpiGrid, &RadioKpiSample, stream);
 }
 
 void
@@ -1268,8 +1592,25 @@ void CreateTraceFiles (void)
     {
         rttStream = traceHelper.CreateFileStream ("rtt_trace.txt");
         *rttStream->GetStream()
-              << "tstamp_us\t" << "ueId\t" << "IMSI\t" << "cellId\t"
+              << "tstamp_us\t" << "ueId\t" << "IMSI\t" << "cellId\t" << "proto\t"
               << "pktSize\t" << "seqNum\t" << "pktUid\t" << "txTstamp_us\t" << "delay" << std::endl;
+    }
+    if(global_params.traceRadioKpi)
+    {
+        // Radio-KPI extension: one combined, already-averaged row per UE per
+        // window (radioKpiGrid), mirroring qos_multiue.cc's windowed-
+        // accumulator pattern rather than a raw per-packet trace file.
+        // mos_* are a synthetic QoE proxy (simplified ITU-T G.107 E-model)
+        // derived from the probes -- not a real application's measured
+        // quality -- and are never used as an anomaly-labeling trigger.
+        radioKpiStream = traceHelper.CreateFileStream ("radio_kpi.csv");
+        *radioKpiStream->GetStream()
+              << "_time\t" << "ueId\t" << "IMSI\t" << "cellId\t" << "pos_x\t" << "pos_y\t"
+              << "http\t" << "https\t" << "icmp\t" << "tcp\t" << "twamp\t" << "udp\t"
+              << "snr_db\t" << "loss_frac\t" << "jitter_ms\t" << "max_consec_loss\t"
+              << "queue_bytes\t" << "mac_retries\t" << "mcs\t"
+              << "mos_http\t" << "mos_https\t" << "mos_icmp\t" << "mos_tcp\t" << "mos_twamp\t" << "mos_udp"
+              << std::endl;
     }
     if(global_params.traceVr)
     {

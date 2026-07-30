@@ -1249,6 +1249,17 @@ UeManager::GetImsi (void) const
   return m_imsi;
 }
 
+uint32_t
+UeManager::GetDrbTxQueueSize (uint8_t drbid) const
+{
+  std::map<uint8_t, Ptr<LteDataRadioBearerInfo> >::const_iterator it = m_drbMap.find (drbid);
+  if (it == m_drbMap.end ())
+    {
+      return 0;
+    }
+  return it->second->m_rlc->GetTxQueueSize ();
+}
+
 uint8_t
 UeManager::GetComponentCarrierId () const
 {

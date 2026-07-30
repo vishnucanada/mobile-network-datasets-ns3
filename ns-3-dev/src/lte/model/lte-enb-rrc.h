@@ -336,11 +336,20 @@ public:
    */
   uint16_t GetRnti (void) const;
 
-  /** 
+  /**
    *
    * \return the IMSI, i.e., a globally unique UE identifier
    */
   uint64_t GetImsi (void) const;
+
+  /**
+   * Radio-KPI extension: current TX-queue occupancy (bytes) of a data radio
+   * bearer's RLC, without exposing the private LteDataRadioBearerInfo/DRB map.
+   *
+   * \param drbid the Data Radio Bearer id
+   * \return the queued TX size in bytes, or 0 if drbid doesn't exist
+   */
+  uint32_t GetDrbTxQueueSize (uint8_t drbid) const;
 
   /**
    *

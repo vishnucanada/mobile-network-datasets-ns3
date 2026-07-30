@@ -152,6 +152,14 @@ LteRlcAm::DoDispose ()
   LteRlc::DoDispose ();
 }
 
+uint32_t
+LteRlcAm::GetTxQueueSize (void) const
+{
+  // Excludes m_txedBuffer (sent but not yet acked/retransmission-eligible),
+  // matching the semantics of LteRlcUm::GetTxQueueSize (data still queued to go out).
+  return m_txonBufferSize + m_retxBufferSize;
+}
+
 
 /**
  * RLC SAP
